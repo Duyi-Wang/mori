@@ -143,16 +143,18 @@ inline DLDataType PythonDtypeToDLPack(DLPackDtype dtype) {
 // Extract DLManagedTensor from Python object
 inline DLManagedTensor* FromPyCapsule(py::capsule capsule) {
   PyObject* obj = capsule.ptr();
-  DLManagedTensor* managed = nullptr;
 
-  if (PyCapsule_IsValid(obj, "dltensor")) {
-    managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
-  } else if (PyCapsule_IsValid(obj, "used_dltensor")) {
-    managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "used_dltensor"));
+  // Per DLPack spec, the producer must supply a capsule named "dltensor"
+  // Consumers are responsible for marking the capsule as used to prevent reuse.
+  DLManagedTensor* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
+  if (!managed) {
+    throw std::runtime_error(
+        "Invalid or already consumed DLPack capsule (expected name 'dltensor')");
   }
 
-  if (!managed) {
-    throw std::runtime_error("Invalid DLPack capsule: expected 'dltensor' or 'used_dltensor'");
+  // Mark the capsule as used so any further access will fail, preserving single-use semantics.
+  if (PyCapsule_SetName(obj, "used_dltensor") != 0) {
+    throw std::runtime_error("Failed to mark DLPack capsule as used");
   }
 
   return managed;
