@@ -154,8 +154,9 @@ class EpDispatchCombineOp:
         indices_capsule = torch_to_dlpack(indices)
 
         # Get current HIP stream from PyTorch
+        # Note: PyTorch uses 'cuda_stream' attribute for both CUDA and HIP backends
         current_stream = torch.cuda.current_stream(input.device)
-        stream_ptr = current_stream.hip_stream
+        stream_ptr = current_stream.cuda_stream
 
         # Call C++ function with DLPack capsules
         result = self._dispatch_func(
@@ -209,8 +210,9 @@ class EpDispatchCombineOp:
         indices_capsule = torch_to_dlpack(indices)
 
         # Get current HIP stream from PyTorch
+        # Note: PyTorch uses 'cuda_stream' attribute for both CUDA and HIP backends
         current_stream = torch.cuda.current_stream(input.device)
-        stream_ptr = current_stream.hip_stream
+        stream_ptr = current_stream.cuda_stream
 
         # Call C++ function with DLPack capsules
         result = self._combine_func(
