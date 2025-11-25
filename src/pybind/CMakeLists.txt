@@ -1,4 +1,17 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+# Try to find pybind11 through Python first (for pip-installed pybind11)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+  OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE PYBIND11_FOUND_RESULT)
+
+if(PYBIND11_FOUND_RESULT EQUAL 0)
+  message(STATUS "Found pybind11 via Python: ${PYBIND11_CMAKE_DIR}")
+  list(APPEND CMAKE_PREFIX_PATH ${PYBIND11_CMAKE_DIR})
+endif()
+
 find_package(pybind11 REQUIRED)
 
 add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
