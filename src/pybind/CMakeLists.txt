@@ -35,6 +35,6 @@ target_link_libraries(
 # For python packages to find dependent libraries
 set_target_properties(
   mori_pybinds
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
+             INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
