@@ -142,7 +142,20 @@ inline DLDataType PythonDtypeToDLPack(DLPackDtype dtype) {
 
 // Extract DLManagedTensor from Python object
 inline DLManagedTensor* FromPyCapsule(py::capsule capsule) {
-  return static_cast<DLManagedTensor*>(capsule);
+  PyObject* obj = capsule.ptr();
+  DLManagedTensor* managed = nullptr;
+
+  if (PyCapsule_IsValid(obj, "dltensor")) {
+    managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
+  } else if (PyCapsule_IsValid(obj, "used_dltensor")) {
+    managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "used_dltensor"));
+  }
+
+  if (!managed) {
+    throw std::runtime_error("Invalid DLPack capsule: expected 'dltensor' or 'used_dltensor'");
+  }
+
+  return managed;
 }
 
 // Create a DLManagedTensor from raw data
@@ -186,11 +199,15 @@ inline py::capsule CreateDLPackCapsule(void* data, const std::vector<int64_t>& s
 
   // Create a PyCapsule with the DLManagedTensor
   return py::capsule(managed_tensor, "dltensor", [](PyObject* obj) {
-    DLManagedTensor* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
-    if (managed) {
-      if (managed->deleter) {
-        managed->deleter(managed);
-      }
+    DLManagedTensor* managed = nullptr;
+    if (PyCapsule_IsValid(obj, "dltensor")) {
+      managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
+    } else if (PyCapsule_IsValid(obj, "used_dltensor")) {
+      managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "used_dltensor"));
+    }
+
+    if (managed && managed->deleter) {
+      managed->deleter(managed);
     }
   });
 }
