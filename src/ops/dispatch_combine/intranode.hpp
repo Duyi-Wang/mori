@@ -85,35 +85,80 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
 
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
+  // Sentinel value to mark duplicate tokens (tokens already sent to same PE by earlier expert)
+  const index_t DUPLICATE_TOKEN_MARKER = config.worldSize * maxNumTokensToSend;
+
+  // Shared memory to track token counts and starting positions per destination PE
+  extern __shared__ char sharedMem[];
+  // Size of tokenCountPerPe is: warpNum * npes
+  index_t* tokenCountPerPe = reinterpret_cast<index_t*>(sharedMem) + warpId * npes;
+  // Start positions in target buffer for each PE
+  index_t* startIndexPerPe = reinterpret_cast<index_t*>(sharedMem) + (warpNum + warpId) * npes;
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp compute token offset on destinition PE
+    // Initialize counters to zero
+    for (int pe = laneId; pe < npes; pe += warpSize) {
+      tokenCountPerPe[pe] = 0;
+      startIndexPerPe[pe] = 0;
+    }
+
+    // Step 1: Count tokens going to each destination PE
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
       index_t destExpert = args.tokenIndices[i];
       index_t destPe = destExpert / config.numExpertPerRank;
-      index_t destTokId = 0;
 
-      // Deduplicate
-      assert(config.numExpertPerToken < warpSize);
+      // Deduplicate: Skip if this token-expert pair goes to the same PE as an earlier expert
+      // for the same token (to avoid sending the same token multiple times to the same PE)
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
         condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
                                config.numExpertPerRank);
       }
       if (__any(condition)) {
-        // Indicate that this token is already sent to the destination PE by setting an overflow
-        // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
+        // Mark as duplicate so we skip it in the write phase
+        if (laneId == 0) args.dispDestTokIdMap[i] = DUPLICATE_TOKEN_MARKER;
         continue;
       }
 
+      // Increment count for this destination PE (lane 0 does the increment)
       if (laneId == 0) {
-        // decide token id in dest pe
-        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
+        tokenCountPerPe[destPe]++;
+      }
+    }
+
+    // Step 2: Allocate starting positions for each destination PE using a single atomicAdd per PE
+    for (int pe = laneId; pe < npes; pe += warpSize) {
+      if (tokenCountPerPe[pe] > 0) {
+        startIndexPerPe[pe] =
+            atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(pe), tokenCountPerPe[pe]);
+        atomicAdd(args.destPeTokenCounter + pe, tokenCountPerPe[pe]);
+      }
+    }
+
+    // Reset counters to track offset within allocated range
+    for (int pe = laneId; pe < npes; pe += warpSize) {
+      tokenCountPerPe[pe] = 0;
+    }
+
+    // Step 3: Write tokens to their allocated positions
+    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
+         i += globalWarpNum) {
+      index_t srcTokId = i / config.numExpertPerToken;
+      index_t destExpert = args.tokenIndices[i];
+      index_t destPe = destExpert / config.numExpertPerRank;
+
+      // Skip duplicates (already marked in step 1)
+      if (args.dispDestTokIdMap[i] == DUPLICATE_TOKEN_MARKER) {
+        continue;
+      }
+
+      // Get the destination token ID from start index + current offset
+      index_t destTokId = 0;
+      if (laneId == 0) {
+        destTokId = startIndexPerPe[destPe] + tokenCountPerPe[destPe];
+        tokenCountPerPe[destPe]++;
         args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
         // TODO: use a switch to control the writing of this buffer, should only turn on for testing
@@ -158,7 +203,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
       args.dispatchGridBarrier[0] = 0;
 
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+      // Send signal to each destPe about how many tokens have been sent to it
+      // +1 to distinguish from uninitialized 0
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
