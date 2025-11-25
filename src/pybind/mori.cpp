@@ -21,161 +21,168 @@
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
 
-#include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/python.h>
-
-#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include "mori/application/application.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
-#include "src/pybind/torch_utils.hpp"
+#include "src/pybind/dlpack_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
-           torch::Tensor>
-LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-               const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
-               const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
-               int blockNum = -1, int warpPerBlock = -1) {
-  assert(input.is_contiguous() && topkIds.is_contiguous());
+std::tuple<py::capsule, std::optional<py::capsule>, std::optional<py::capsule>, py::capsule,
+           py::capsule>
+LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType, py::capsule input,
+               const std::optional<py::capsule>& weights, const std::optional<py::capsule>& scales,
+               py::capsule topkIds, int blockNum, int warpPerBlock, uint64_t stream_ptr) {
+  DLTensor* inputTensor = mori::GetDLTensor(input);
+  DLTensor* topkIdsTensor = mori::GetDLTensor(topkIds);
+
+  assert(mori::IsDLTensorContiguous(inputTensor) && mori::IsDLTensorContiguous(topkIdsTensor));
 
   float* weightPtr = nullptr;
   if (weights.has_value()) {
-    assert(weights->is_contiguous() && weights->element_size() == sizeof(float));
-    weightPtr = weights->data_ptr<float>();
+    DLTensor* weightsTensor = mori::GetDLTensor(weights.value());
+    assert(mori::IsDLTensorContiguous(weightsTensor) &&
+           mori::GetDLTensorElementSize(weightsTensor) == sizeof(float));
+    weightPtr = static_cast<float*>(weightsTensor->data);
   }
 
   uint8_t* scalePtr = nullptr;
+  DLTensor* scalesTensor = nullptr;
   if (scales.has_value() && handle.config.scaleDim > 0) {
-    assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
-    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+    scalesTensor = mori::GetDLTensor(scales.value());
+    assert(mori::IsDLTensorContiguous(scalesTensor) &&
+           mori::GetDLTensorElementSize(scalesTensor) == handle.config.scaleTypeSize);
+    scalePtr = static_cast<uint8_t*>(scalesTensor->data);
   }
 
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          input.size(0));
-  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                        at::cuda::getCurrentHIPStream());
+  handle.PrepareInference(
+      mori::DLPackDtypeToHipDataType(inputTensor->dtype), inputTensor->data, nullptr, weightPtr,
+      scalePtr, static_cast<mori::moe::index_t*>(topkIdsTensor->data), inputTensor->shape[0]);
 
-  torch::Tensor out =
-      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+  hipStream_t stream = reinterpret_cast<hipStream_t>(stream_ptr);
+  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock, stream);
 
-  torch::Tensor outWeights = torch::from_blob(
-      handle.shmemDispatchOutWeightsMemObj->Get(),
-      {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
-      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
+  py::capsule out =
+      mori::CreateDLPackCapsule(handle.shmemDispatchOutTokMemObj->Get(),
+                                {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+                                inputTensor->dtype, inputTensor->device.device_id);
 
-  std::optional<torch::Tensor> outScales{std::nullopt};
+  std::optional<py::capsule> outWeights{std::nullopt};
+  if (weights.has_value()) {
+    DLDataType float32Type = mori::GetDLPackDataType<float>();
+    outWeights = mori::CreateDLPackCapsule(
+        handle.shmemDispatchOutWeightsMemObj->Get(),
+        {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken}, float32Type,
+        inputTensor->device.device_id);
+  }
+
+  std::optional<py::capsule> outScales{std::nullopt};
   if (scales.has_value() && handle.config.scaleDim > 0) {
     outScales =
-        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
-                         {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
-                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+        mori::CreateDLPackCapsule(handle.shmemOutScalesMemObj->Get(),
+                                  {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
+                                  scalesTensor->dtype, inputTensor->device.device_id);
   }
 
-  torch::Tensor outIndices =
-      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
+  DLDataType indexType = mori::GetDLPackDataType<mori::moe::index_t>();
+  py::capsule outIndices = mori::CreateDLPackCapsule(
+      handle.shmemOutIndicesMemObj->Get(),
+      {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken}, indexType,
+      inputTensor->device.device_id);
 
-  torch::Tensor totalRecvTokenNum =
-      torch::from_blob(handle.totalRecvTokenNum, {1},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
+  py::capsule totalRecvTokenNum = mori::CreateDLPackCapsule(
+      handle.totalRecvTokenNum, {1}, indexType, inputTensor->device.device_id);
+
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
-// TODO: translate data type
-// template <typename T>
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
-    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
-    int warpPerBlock) {
-  assert(input.is_contiguous() && topkIds.is_contiguous());
+std::tuple<py::capsule, std::optional<py::capsule>> LaunchCombine(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType, py::capsule input,
+    const std::optional<py::capsule>& weights, py::capsule topkIds, int blockNum, int warpPerBlock,
+    uint64_t stream_ptr) {
+  DLTensor* inputTensor = mori::GetDLTensor(input);
+  DLTensor* topkIdsTensor = mori::GetDLTensor(topkIds);
+
+  assert(mori::IsDLTensorContiguous(inputTensor) && mori::IsDLTensorContiguous(topkIdsTensor));
 
   float* weightsPtr = nullptr;
-  if (weights.has_value() && weights->size(0) != 0) {
-    assert(weights->is_contiguous());
-    weightsPtr = weights->data_ptr<float>();
+  DLTensor* weightsTensor = nullptr;
+  if (weights.has_value()) {
+    weightsTensor = mori::GetDLTensor(weights.value());
+    if (weightsTensor->shape[0] != 0) {
+      assert(mori::IsDLTensorContiguous(weightsTensor));
+      weightsPtr = static_cast<float*>(weightsTensor->data);
+    }
   }
 
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          handle.curRankNumToken);
-  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                       at::cuda::getCurrentHIPStream());
+  handle.PrepareInference(
+      mori::DLPackDtypeToHipDataType(inputTensor->dtype), inputTensor->data, nullptr, weightsPtr,
+      static_cast<mori::moe::index_t*>(topkIdsTensor->data), handle.curRankNumToken);
 
-  auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
-  torch::Tensor out =
-      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
-                       {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
+  hipStream_t stream = reinterpret_cast<hipStream_t>(stream_ptr);
+  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock, stream);
 
-  std::optional<torch::Tensor> outWeights{std::nullopt};
-  if (weightsPtr) {
-    outWeights =
-        torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
-                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
-                         torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
+  py::capsule out =
+      mori::CreateDLPackCapsule(handle.shmemCombineOutTokMemObj->Get(),
+                                {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+                                inputTensor->dtype, inputTensor->device.device_id);
+
+  std::optional<py::capsule> outWeights{std::nullopt};
+  if (weightsPtr && weightsTensor != nullptr) {
+    outWeights = mori::CreateDLPackCapsule(
+        handle.shmemCombineOutWeightsMemObj->Get(),
+        {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+        weightsTensor->dtype, inputTensor->device.device_id);
   }
 
   return {out, outWeights};
 }
 
-void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
-  handle.LaunchReset(at::cuda::getCurrentHIPStream());
+void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, uint64_t stream_ptr) {
+  hipStream_t stream = reinterpret_cast<hipStream_t>(stream_ptr);
+  handle.LaunchReset(stream);
 }
 
-torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>(),
-                       {*handle.totalRecvTokenNum}, options);
+py::capsule GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+  DLDataType indexType = mori::GetDLPackDataType<mori::moe::index_t>();
+  py::capsule tensor = mori::CreateDLPackCapsule(
+      handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>(),
+      {*handle.totalRecvTokenNum}, indexType, 0);
   return tensor;
 }
 
-torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor = torch::from_blob(
-      handle.dispSenderIdxMap, {handle.curRankNumToken * handle.config.numExpertPerToken}, options);
+py::capsule GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  DLDataType indexType = mori::GetDLPackDataType<mori::moe::index_t>();
+  py::capsule tensor = mori::CreateDLPackCapsule(
+      handle.dispSenderIdxMap, {handle.curRankNumToken * handle.config.numExpertPerToken},
+      indexType, 0);
   return tensor;
 }
 
-torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.dispReceiverIdxMap, {*handle.localPeTokenCounter}, options);
+py::capsule GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  DLDataType indexType = mori::GetDLPackDataType<mori::moe::index_t>();
+  py::capsule tensor = mori::CreateDLPackCapsule(handle.dispReceiverIdxMap,
+                                                 {*handle.localPeTokenCounter}, indexType, 0);
   return tensor;
 }
 
-torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
-                                              at::ScalarType scalarType) {
-  torch::Tensor out =
-      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-                       torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
+py::capsule GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
+                                            mori::DLPackDtype dtype) {
+  DLDataType dlType = mori::PythonDtypeToDLPack(dtype);
+  py::capsule out = mori::CreateDLPackCapsule(
+      handle.shmemCombineInpTokMemObj->Get(),
+      {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim}, dlType, 0);
   return out;
 }
 
@@ -236,6 +243,17 @@ namespace {}
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
+  pybind11::enum_<mori::DLPackDtype>(m, "DLPackDtype")
+      .value("Float32", mori::DLPackDtype::kFloat32)
+      .value("Float16", mori::DLPackDtype::kFloat16)
+      .value("BFloat16", mori::DLPackDtype::kBFloat16)
+      .value("Int32", mori::DLPackDtype::kInt32)
+      .value("Int64", mori::DLPackDtype::kInt64)
+      .value("UInt32", mori::DLPackDtype::kUInt32)
+      .value("UInt64", mori::DLPackDtype::kUInt64)
+      .value("Float8_e4m3fnuz", mori::DLPackDtype::kFloat8_e4m3fnuz)
+      .export_values();
+
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)

@@ -19,7 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from __future__ import annotations
+
 from mori import cpp as mori_cpp
+from mori.ops.dlpack_utils import torch_to_dlpack, dlpack_to_torch, get_dlpack_dtype
 
 from dataclasses import dataclass
 import torch
@@ -51,12 +54,12 @@ class EpDispatchCombineConfig:
     rdma_block_num: int = 0
 
 
-def _cpp_dispatch_combine_factory(entity_name):
+def _cpp_dispatch_combine_factory(entity_name: str):
     return getattr(mori_cpp, entity_name)
 
 
 class EpDispatchCombineOp:
-    def __init__(self, config):
+    def __init__(self, config: EpDispatchCombineConfig) -> None:
         self.config = config
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
@@ -98,55 +101,145 @@ class EpDispatchCombineOp:
             "get_registered_combine_input_buffer"
         )
 
-    def get_registered_combine_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_combine_input_buffer(self._handle, dtype)
+    def get_registered_combine_input_buffer(self, dtype: torch.dtype) -> torch.Tensor:
+        """Get the registered combine input buffer for external use.
+
+        Args:
+            dtype: The desired data type for the buffer.
+
+        Returns:
+            torch.Tensor: The registered buffer tensor.
+        """
+        dlpack_dtype = get_dlpack_dtype(dtype)
+        capsule = self._get_registered_combine_input_buffer(self._handle, dlpack_dtype)
+        return dlpack_to_torch(capsule)
 
     def dispatch(
         self,
         input: torch.Tensor,
-        weights: torch.Tensor,
-        scales: torch.Tensor,
+        weights: torch.Tensor | None,
+        scales: torch.Tensor | None,
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
-    ):
-        return self._dispatch_func(
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Dispatch tokens to corresponding experts.
+
+        Args:
+            input: Input tokens [num_tokens, hidden_dim]
+            weights: Routing weights [num_tokens, num_experts_per_token] or None
+            scales: Quantization scales [num_tokens, scale_dim] or None
+            indices: Expert indices [num_tokens, num_experts_per_token]
+            block_num: Number of GPU blocks (optional)
+            warp_per_block: Number of warps per block (optional)
+
+        Returns:
+            tuple: (out, out_weights, out_scales, out_indices, total_recv_token_num)
+                - out: Dispatched tokens [max_tokens_to_recv, hidden_dim]
+                - out_weights: Dispatched weights [max_tokens_to_recv, num_experts_per_token] or None
+                - out_scales: Dispatched scales [max_tokens_to_recv, scale_dim] or None
+                - out_indices: Dispatched indices [max_tokens_to_recv, num_experts_per_token]
+                - total_recv_token_num: Actual number of received tokens [1]
+        """
+        # Convert tensors to DLPack capsules
+        input_capsule = torch_to_dlpack(input)
+        weights_capsule = torch_to_dlpack(weights) if weights is not None else None
+        scales_capsule = torch_to_dlpack(scales) if scales is not None else None
+        indices_capsule = torch_to_dlpack(indices)
+
+        # Get current HIP stream from PyTorch
+        current_stream = torch.cuda.current_stream(input.device)
+        stream_ptr = current_stream.hip_stream
+
+        # Call C++ function with DLPack capsules
+        result = self._dispatch_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            scales,
-            indices,
+            input_capsule,
+            weights_capsule,
+            scales_capsule,
+            indices_capsule,
             block_num,
             warp_per_block,
+            stream_ptr,
         )
+
+        # Convert result capsules back to torch tensors
+        out = dlpack_to_torch(result[0])
+        out_weights = dlpack_to_torch(result[1]) if result[1] is not None else None
+        out_scales = dlpack_to_torch(result[2]) if result[2] is not None else None
+        out_indices = dlpack_to_torch(result[3])
+        total_recv_token_num = dlpack_to_torch(result[4])
+
+        return (out, out_weights, out_scales, out_indices, total_recv_token_num)
 
     def combine(
         self,
         input: torch.Tensor,
-        weights: torch.Tensor,
+        weights: torch.Tensor | None,
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
         call_reset: bool = False,
-    ):
-        output = self._combine_func(
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Combine expert outputs back to original token order.
+
+        Args:
+            input: Expert processed tokens [num_processed_tokens, hidden_dim]
+            weights: Routing weights [num_processed_tokens, num_experts_per_token] or None
+            indices: Token indices [num_processed_tokens, num_experts_per_token]
+            block_num: Number of GPU blocks (optional)
+            warp_per_block: Number of warps per block (optional)
+            call_reset: Whether to reset state after combine
+
+        Returns:
+            tuple: (out, out_weights)
+                - out: Combined output tokens [max_num_inp_token_per_rank, hidden_dim]
+                - out_weights: Combined weights [max_num_inp_token_per_rank, num_experts_per_token] or None
+        """
+        # Convert tensors to DLPack capsules
+        input_capsule = torch_to_dlpack(input)
+        weights_capsule = torch_to_dlpack(weights) if weights is not None else None
+        indices_capsule = torch_to_dlpack(indices)
+
+        # Get current HIP stream from PyTorch
+        current_stream = torch.cuda.current_stream(input.device)
+        stream_ptr = current_stream.hip_stream
+
+        # Call C++ function with DLPack capsules
+        result = self._combine_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            indices,
+            input_capsule,
+            weights_capsule,
+            indices_capsule,
             block_num,
             warp_per_block,
+            stream_ptr,
         )
-        if call_reset:
-            self._reset_func(self._handle)
-        return output
 
-    def reset(self):
+        if call_reset:
+            self._reset_func(self._handle, stream_ptr)
+
+        # Convert result capsules back to torch tensors
+        out = dlpack_to_torch(result[0])
+        out_weights = dlpack_to_torch(result[1]) if result[1] is not None else None
+
+        return (out, out_weights)
+
+    def reset(self) -> None:
+        """Reset internal state for next inference round."""
         self._reset_func(self._handle)
 
-    def _allgather_with_token_num_padding(self, input, max_token_num):
+    def _allgather_with_token_num_padding(
+        self, input: torch.Tensor, max_token_num: int
+    ) -> list[torch.Tensor]:
         shape = list(input.shape)
 
         pad_shape = shape.copy()
@@ -177,7 +270,13 @@ class EpDispatchCombineOp:
         dist.all_gather(output, padded_input)
         return output
 
-    def get_dispatch_src_token_pos(self):
+    def get_dispatch_src_token_pos(self) -> torch.Tensor:
+        """
+        Get the source token positions after dispatch.
+
+        Returns:
+            torch.Tensor: Source token positions mapping [num_received_tokens]
+        """
         torch.cuda.synchronize()
 
         if self.config.kernel_type.value in (
@@ -185,13 +284,14 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.InterNodeV1.value,
             EpDispatchCombineKernelType.InterNodeV1LL.value,
         ):
-            return self._get_dispatch_src_token_pos_func(self._handle)
+            capsule = self._get_dispatch_src_token_pos_func(self._handle)
+            return dlpack_to_torch(capsule)
 
-        dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
-            self._handle
+        dispatch_sender_token_id_map = dlpack_to_torch(
+            self._get_dispatch_sender_token_idx_map_func(self._handle)
         )
-        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
-            self._handle
+        dispatch_receiver_token_id_map = dlpack_to_torch(
+            self._get_dispatch_receiver_token_idx_map_func(self._handle)
         )
 
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank

@@ -29,29 +29,27 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 
-def _get_torch_cmake_prefix_path() -> str:
-    import torch
-
-    return torch.utils.cmake_prefix_path
-
-
 _supported_arch_list = ["gfx942"]
 
 
 def _get_gpu_archs() -> str:
-    archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
+    # Priority: MORI_GPU_ARCHS > GPU_ARCHS > PYTORCH_ROCM_ARCH > default
+    archs = os.environ.get("MORI_GPU_ARCHS", None)
     if not archs:
-        import torch
+        archs = os.environ.get("GPU_ARCHS", None)
+    if not archs:
+        archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
+    if not archs:
+        # Try to get from torch if available, but don't fail if not found
+        try:
+            import torch
 
-        archs = torch._C._cuda_getArchFlags()
-
-    gpu_archs = os.environ.get("GPU_ARCHS", None)
-    if gpu_archs:
-        archs = gpu_archs
-
-    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
-    if mori_gpu_archs:
-        archs = mori_gpu_archs
+            archs = torch._C._cuda_getArchFlags()
+        except (ImportError, AttributeError):
+            archs = None
+    # Default to supported architectures
+    if not archs:
+        archs = ";".join(_supported_arch_list)
 
     arch_list = archs.replace(" ", ";").split(";")
 
@@ -87,21 +85,32 @@ class CMakeBuild(build_ext):
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
         gpu_archs = _get_gpu_archs()
-        subprocess.check_call(
-            [
-                "cmake",
-                "-DUSE_ROCM=ON",
-                f"-DCMAKE_BUILD_TYPE={build_type}",
-                f"-DWARP_ACCUM_UNROLL={unroll_value}",
-                f"-DUSE_BNXT={use_bnxt}",
-                f"-DGPU_TARGETS={gpu_archs}",
-                "-B",
-                str(build_dir),
-                "-S",
-                str(root_dir),
-                f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
-            ]
-        )
+
+        # Build cmake command
+        cmake_args = [
+            "cmake",
+            "-DUSE_ROCM=ON",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+            f"-DWARP_ACCUM_UNROLL={unroll_value}",
+            f"-DUSE_BNXT={use_bnxt}",
+            f"-DGPU_TARGETS={gpu_archs}",
+            "-B",
+            str(build_dir),
+            "-S",
+            str(root_dir),
+        ]
+
+        # Add CMAKE_PREFIX_PATH for TorchBootstrap
+        try:
+            import torch
+
+            cmake_args.append(f"-DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}")
+        except ImportError:
+            raise ImportError(
+                "PyTorch is required to build Mori with TorchBootstrap support"
+            )
+
+        subprocess.check_call(cmake_args)
         subprocess.check_call(
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
